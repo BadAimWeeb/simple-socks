@@ -169,7 +169,7 @@ export const encapsulateUDP = (
   } else {
     let i = (addressObject as Address6).toByteArray();
     for (let j = 0; j < 16; j++) {
-      buffer.writeUint8(i[j], 4 + j);
+      buffer.writeInt8(i[j], 4 + j);
     }
 
     buffer.writeUint16BE(port, 20); // DST.PORT
