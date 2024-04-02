@@ -33,6 +33,143 @@ export const waitForConnect = <T extends Socket>(socket: T) =>
     socket.once("connect", connectHandler);
   });
 
+/**
+ * +----+------+------+----------+----------+----------+
+ * |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+ * +----+------+------+----------+----------+----------+
+ * | 2  |  1   |  1   | Variable |    2     | Variable |
+ * +----+------+------+----------+----------+----------+
+ */
+export const decapsulateUDP = (buffer: Buffer) => {
+  const binaryStream = stream<{
+    frag: number;
+    atyp: number;
+    addr: { buf: Buffer; a: number; b: number; c: number; d: number };
+    data: Buffer;
+    // manually set:
+    dst: { addr: string; port: number };
+  }>(buffer);
+
+  let escapeData: {
+    frag: number;
+    atyp: number;
+    dst: { addr: string; port: number };
+    data: Buffer;
+  };
+
+  binaryStream
+    .word16bu("rsv")
+    .word8("frag")
+    .word8("atyp")
+    .tap((args) => {
+      let addr = "";
+
+      if (args.atyp === RFC_1928_ATYP.IPV4) {
+        binaryStream
+          .buffer("addr.buf", LENGTH_RFC_1928_ATYP)
+          .tap((args) => {
+            addr = [].slice.call(args.addr.buf).join(".");
+          });
+      } else if (args.atyp === RFC_1928_ATYP.IPV6) {
+        binaryStream
+          .word32be("addr.a")
+          .word32be("addr.b")
+          .word32be("addr.c")
+          .word32be("addr.d")
+          .tap((args) => {
+            const parts: string[] = [];
+
+            // extract the parts of the ipv6 address
+            for (const part of ["a", "b", "c", "d"]) {
+              const x: number = args.addr[part as "a" | "b" | "c" | "d"];
+
+              // convert DWORD to two WORD values and append
+              parts.push((x >>> 16).toString(16));
+              parts.push((x & 0xffff).toString(16));
+            }
+
+            // format ipv6 address as string
+            addr = parts.join(":");
+          });
+      }
+
+      args.dst = { addr, port: 0 };
+    })
+    .word16bu("dst.port")
+    .tap((args) => {
+      if (args.atyp === RFC_1928_ATYP.IPV4) {
+        binaryStream.buffer("data", buffer.length - 10);
+      } else if (args.atyp === RFC_1928_ATYP.IPV6) {
+        binaryStream.buffer("data", buffer.length - 22);
+      }
+    })
+    .tap((args) => {
+      escapeData = {
+        frag: args.frag,
+        atyp: args.atyp,
+        dst: args.dst,
+        data: args.data
+      };
+    });
+
+  return escapeData!;
+}
+
+/**
+ * +----+------+------+----------+----------+----------+
+ * |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+ * +----+------+------+----------+----------+----------+
+ * | 2  |  1   |  1   | Variable |    2     | Variable |
+ * +----+------+------+----------+----------+----------+
+ */
+export const encapsulateUDP = (
+  frag: number,
+  addr: string,
+  port: number,
+  data: Buffer,
+) => {
+  let addressObject = new Address6(addr);
+  let atyp = addressObject.v4 ? RFC_1928_ATYP.IPV4 : RFC_1928_ATYP.IPV6;
+
+  if (port < 1 || port > 65535) {
+    throw new Error("Invalid port");
+  }
+
+  let buffer: Buffer;
+  if (atyp === RFC_1928_ATYP.IPV4) {
+    buffer = Buffer.alloc(10 + data.length);
+  } else {
+    buffer = Buffer.alloc(22 + data.length);
+  }
+
+  buffer.writeUint16BE(0, 0); // RSV
+  buffer.writeUint8(frag, 2); // FRAG
+  buffer.writeUint8(atyp, 3); // ATYP
+  
+  // DST.ADDR
+  if (atyp === RFC_1928_ATYP.IPV4) {
+    let i = addressObject.address4!.toArray();
+    for (let j = 0; j < 4; j++) {
+      buffer.writeUint8(i[j], 4 + j);
+    }
+
+    buffer.writeUint16BE(port, 8); // DST.PORT
+
+    data.copy(buffer, 10); // DATA
+  } else {
+    let i = addressObject.toByteArray();
+    for (let j = 0; j < 16; j++) {
+      buffer.writeUint8(i[j], 4 + j);
+    }
+
+    buffer.writeUint16BE(port, 20); // DST.PORT
+
+    data.copy(buffer, 22); // DATA
+  }
+
+  return buffer;
+}
+
 export interface ProxyServerOptions {
   /**
    * Determine if the connection to the destination is allowed.
