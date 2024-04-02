@@ -11,6 +11,7 @@ import {
 import { stream } from "binary";
 import type { Socket, Server } from "node:net";
 import { connect, createServer } from "node:net";
+import { Address4, Address6 } from "ip-address";
 
 /**
  *
@@ -43,6 +44,16 @@ export interface ProxyServerOptions {
     socket: Socket,
   ): Promise<boolean> | boolean;
   /**
+   * For advanced uses only.
+   * Determine if the UDP associate command is allowed.
+   * @returns If the return resolves to true, the proxy will proceed. Otherwise, the UDP associate command is not allowed and the connection will be ended.
+   */
+  udpFilter?(
+    port: number,
+    host: string,
+    socket: Socket,
+  ): Promise<boolean> | boolean;
+  /**
    * @returns If the return resolves to true, the proxy will proceed. Otherwise, the credentials are incorrect and the connection will be ended.
    */
   authenticate?(
@@ -52,16 +63,29 @@ export interface ProxyServerOptions {
   ): Promise<boolean> | boolean;
   /**
    * This is intended for slightly higher APIs.
+   * 
    * What will work:
    * - Chaining socks proxies (Server connects to internal socks proxy eg Tor)
    * - Redirecting to more secure services (80 -> 443, wrapped in tls.connect)
+   * 
    * What will not work:
    * - Wrapping sockets in TLS to services that don't support TLS
+   * 
    * @returns You must bind the `connect` and `error` events to resolve/reject. Once the promise is resolved, it is assumed that the socket is connected. Returning a normal socket will assume it is not connected already.
    *
    * If your API provides the `connect` and `error` event, you can use our built-in promise wrapper `waitForConnect`.
    */
   connect(port: number, host: string, socket: Socket): Promise<Socket> | Socket;
+  /**
+   * For advanced uses only.
+   * This gives you chances to support UDP associate command and allow UDP packets to be sent through the proxy.
+   * 
+   * @returns If you cannot accept the UDP associate command, you must reject, otherwise send an listen address and port that closes when the requesting TCP connection closes.
+   */
+  udpAssociate?(port: number, host: string, socket: Socket): Promise<{
+    address: string;
+    port: number;
+  }> | { address: string; port: number };
 }
 
 function isErrCode(err: unknown): err is { code: string } {
@@ -84,7 +108,7 @@ function addProxyListeners(server: Server, options: ProxyServerOptions) {
 
   server.on("connection", (socket) => {
     // eslint-disable-next-line @typescript-eslint/no-empty-function
-    socket.on("error", () => {});
+    socket.on("error", () => { });
 
     /**
      * +----+------+----------+------+----------+
@@ -273,9 +297,83 @@ function addProxyListeners(server: Server, options: ProxyServerOptions) {
                 throw err;
               }
             }
+          } else if (args.cmd === RFC_1928_COMMANDS.UDP_ASSOCIATE) {
+            // UDP associate
+            if (!options.udpAssociate)
+              return endConnect(RFC_1928_REPLIES.COMMAND_NOT_SUPPORTED, buffer);
+
+            if (options.udpFilter) {
+              const filtered = await options.udpFilter(
+                args.dst.port,
+                args.dst.addr,
+                socket,
+              );
+              // respond with failure
+              if (!filtered)
+                return endConnect(
+                  RFC_1928_REPLIES.CONNECTION_NOT_ALLOWED,
+                  buffer,
+                );
+            }
+
+            try {
+              const { address, port } = await options.udpAssociate(
+                args.dst.port,
+                args.dst.addr,
+                socket,
+              );
+
+              // validation
+              let isIPv4 = address.includes(".");
+              let addressObject: Address4 | Address6;
+              try {
+                addressObject = isIPv4
+                  ? new Address4(address)
+                  : new Address6(address);
+              } catch {
+                return endConnect(
+                  RFC_1928_REPLIES.GENERAL_FAILURE,
+                  buffer,
+                );
+              }
+
+              if (port < 1 || port > 65535) {
+                return endConnect(
+                  RFC_1928_REPLIES.GENERAL_FAILURE,
+                  buffer,
+                );
+              }
+
+              // prepare a success response
+              const responseBuffer = [];
+              responseBuffer.push(RFC_1928_VERSION);
+              responseBuffer.push(RFC_1928_REPLIES.SUCCEEDED);
+              responseBuffer.push(0x00); // reserved
+              responseBuffer.push(addressObject.v4 ? 0x01 : 0x04); // address type
+              if (addressObject.v4) {
+                const addressObjectV4 = addressObject as Address4;
+
+                responseBuffer.push(...addressObjectV4.toArray());
+              } else {
+                const addressObjectV6 = addressObject as Address6;
+
+                responseBuffer.push(...addressObjectV6.toByteArray());
+              }
+
+              responseBuffer.push((port >> 8) & 0xff);
+              responseBuffer.push(port & 0xff);
+
+              // write acknowledgement to client...
+              socket.write(Buffer.from(responseBuffer));
+            } catch (e) {
+              return endConnect(
+                RFC_1928_REPLIES.GENERAL_FAILURE,
+                buffer,
+              );
+            }
           } else {
-            // bind and udp associate commands
-            return endConnect(RFC_1928_REPLIES.SUCCEEDED, buffer);
+            // anything else
+            return endConnect(RFC_1928_REPLIES.COMMAND_NOT_SUPPORTED, buffer);
           }
         });
     };
