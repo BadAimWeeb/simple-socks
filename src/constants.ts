@@ -39,3 +39,5 @@ export const RFC_1929_REPLIES = {
 };
 
 export const RFC_1929_VERSION = 0x01;
+
+export const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}$/;

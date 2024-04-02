@@ -7,6 +7,7 @@ import {
   RFC_1928_VERSION,
   RFC_1929_REPLIES,
   RFC_1929_VERSION,
+  ipv4Regex
 } from "./constants.js";
 import { stream } from "binary";
 import type { Socket, Server } from "node:net";
@@ -128,7 +129,16 @@ export const encapsulateUDP = (
   port: number,
   data: Buffer,
 ) => {
-  let addressObject = new Address6(addr);
+  let addressObject: Address4 | Address6;
+  try {
+    let isIPv4 = ipv4Regex.test(addr);
+    addressObject = isIPv4 ? new Address4(addr) : new Address6(addr);
+
+    if (addressObject instanceof Address6 && addressObject.address4)
+      addressObject = addressObject.address4;
+  } catch {
+    throw new Error("Invalid address");
+  }
   let atyp = addressObject.v4 ? RFC_1928_ATYP.IPV4 : RFC_1928_ATYP.IPV6;
 
   if (port < 1 || port > 65535) {
@@ -145,10 +155,10 @@ export const encapsulateUDP = (
   buffer.writeUint16BE(0, 0); // RSV
   buffer.writeUint8(frag, 2); // FRAG
   buffer.writeUint8(atyp, 3); // ATYP
-  
+
   // DST.ADDR
   if (atyp === RFC_1928_ATYP.IPV4) {
-    let i = addressObject.address4!.toArray();
+    let i = (addressObject as Address4).toArray();
     for (let j = 0; j < 4; j++) {
       buffer.writeUint8(i[j], 4 + j);
     }
@@ -157,7 +167,7 @@ export const encapsulateUDP = (
 
     data.copy(buffer, 10); // DATA
   } else {
-    let i = addressObject.toByteArray();
+    let i = (addressObject as Address6).toByteArray();
     for (let j = 0; j < 16; j++) {
       buffer.writeUint8(i[j], 4 + j);
     }
@@ -461,15 +471,18 @@ function addProxyListeners(server: Server, options: ProxyServerOptions) {
               );
 
               // validation
-              let isIPv4 = address.includes(".");
               let addressObject: Address4 | Address6;
               try {
+                let isIPv4 = ipv4Regex.test(address);
                 addressObject = isIPv4
                   ? new Address4(address)
                   : new Address6(address);
+
+                if (addressObject instanceof Address6 && addressObject.address4)
+                  addressObject = addressObject.address4;
               } catch {
                 return endConnect(
-                  RFC_1928_REPLIES.GENERAL_FAILURE,
+                  RFC_1928_REPLIES.NETWORK_UNREACHABLE,
                   buffer,
                 );
               }
@@ -502,7 +515,7 @@ function addProxyListeners(server: Server, options: ProxyServerOptions) {
 
               // write acknowledgement to client...
               socket.write(Buffer.from(responseBuffer));
-            } catch (e) {
+            } catch {
               return endConnect(
                 RFC_1928_REPLIES.GENERAL_FAILURE,
                 buffer,
